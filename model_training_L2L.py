@@ -14,7 +14,7 @@ import argparse
 
 from tqdm import tqdm  # Import tqdm for progress 
 
-from model import TransformerModel  # Import TransformerModel
+from model import TransformerModel, L2LModel, L2LModel_GSP  # Import TransformerModel, L2LModel
 
 # Enable cuDNN benchmark for optimized performance
 torch.backends.cudnn.benchmark = True
@@ -98,7 +98,7 @@ class ModelTrainer:
     def __init__(self, data_path, test_size=0.2, lr=0.0005, epochs=100, 
                  model_save_path="best_model.pth", batch_size=64, 
                  accumulation_steps=1, num_workers=4, patience=10,
-                 speed_limit=60.0, max_agents=10):
+                 argumented_data=False, max_agents=10):
         """
         Initializes the ModelTrainer with the given parameters.
 
@@ -124,11 +124,11 @@ class ModelTrainer:
         self.accumulation_steps = accumulation_steps
         self.num_workers = num_workers
         self.patience = patience
-        self.speed_limit = speed_limit  # Added speed limit
+        self.argumented_data = argumented_data
         self.max_agents = max_agents
 
         # Initialize model, loss, optimizer, scheduler, scaler
-        self.model = TransformerModel(embed_dim=8, num_heads=2, num_layers=2, dropout=0.0, max_agents=self.max_agents).to(device)
+        self.model = L2LModel(embed_dim=8, num_heads=2, num_layers=2, dropout=0.0, max_agents=self.max_agents).to(device)
 
         if torch.cuda.device_count() > 1:
             print(f"Using {torch.cuda.device_count()} GPUs")
@@ -150,41 +150,38 @@ class ModelTrainer:
 
     def generate_augmented_data(self, data):
         """
-        Generate augmented data by sampling vectors and modifying the original data.
+        Generate augmented data by adjusting x and speed of ego car.
         """
 
-        speed_vector = [0] # np.arange(-0.5, 0.6, 0.1)  # -0.5 to 0.5 inclusive
-        y_vector = [0] #np.arange(-0.2, 0.3, 0.1)  # -0.2 to 0.2 inclusive
+        t_vectors = np.arange(-0.5, 0.6, 0.1)  # -0.5 to 0.5 inclusive
         
         augmented_data = []
-        total_vectors = len(speed_vector) * len(y_vector)
-        print(f"Generating augmented data with {total_vectors} vectors...")
+        print(f"Generating augmented data with {len(t_vectors)} vectors...")
 
-        for delta_speed in speed_vector:
-            for delta_y in y_vector:
+        for dt in t_vectors:
+            # Create a copy of the original data to modify
+            modified = data.copy()
 
-                # Create a copy of the original data to modify
-                modified = data.copy()
+            # Adjust ego_car_speed
+            modified['ego_car_speed'] = (modified['ego_car_speed'] + dt * modified['ego_car_accel']).clip(lower=0)
 
-                # Adjust ego_car_speed
-                modified['ego_car_speed'] += delta_speed
+            # Adjust ego_car_x and relative surrounding_agent_x
+            modified['ego_car_x'] += modified['ego_car_speed'] * dt
+            modified['surrounding_agent_x'] -= modified['ego_car_x']
+            modified['ego_car_x'] = 0
 
-                # Ego Car's y position is shifted by dy
-                modified['ego_car_y'] += delta_y
+            # Adjust acceleration if applicable
+            modified['ego_car_accel'] -= dt * 0.1
 
-                # Adjust acceleration and dy if applicable
-                modified['ego_car_accel'] -= delta_speed * 0.1
-                modified['ego_car_dy'] -= delta_y
-                
-                # Check for extreme values to prevent numerical issues
-                relevant_columns = ['ego_car_x', 'ego_car_y', 'ego_car_speed',
-                                    'surrounding_agent_x', 'surrounding_agent_y', 'surrounding_agent_speed',
-                                    'speed_limit', 'ego_car_accel', 'ego_car_dy']
-                if (modified[relevant_columns].abs() > 1e3).any().any():
-                    print(f"Skipping vector with delta_speed {delta_speed:.2f} and delta_y {y_vector:.2f} due to extreme values.")
-                    continue  # Skip this vector
+            # Check for extreme values to prevent numerical issues
+            relevant_columns = ['ego_car_x', 'ego_car_y', 'ego_car_speed',
+                                'surrounding_agent_x', 'surrounding_agent_y', 'surrounding_agent_speed',
+                                'speed_limit', 'ego_car_accel', 'ego_car_dy']
+            if (modified[relevant_columns].abs() > 1e3).any().any():
+                print(f"Skipping vector with dt {dt:.2f} due to extreme values.")
+                continue
 
-                augmented_data.append(modified)
+            augmented_data.append(modified)
 
         if augmented_data:
             augmented_df = pd.concat(augmented_data, ignore_index=True)
@@ -234,18 +231,23 @@ class ModelTrainer:
 
         # **Set ego_car_x to 0 and adjust surrounding_agent_x accordingly**
         original_ego_x = data['ego_car_x'].copy()
-        data['ego_car_x'] = 0.0  # Fixed ego_x
-        data['surrounding_agent_x'] = data['surrounding_agent_x'] - original_ego_x  # Relative x
+        data['ego_car_x'] = 0  # Fixed ego_x
+        data['surrounding_agent_x'] -= original_ego_x  # Adjust surrounding_agent_x
+        # data['surrounding_agent_x'] = np.log(data['surrounding_agent_x'] - original_ego_x)  # Log transformation
 
         # Generate augmented data
-        # augmented_data = self.generate_augmented_data(data)
+        if self.argumented_data:
+            augmented_data = self.generate_augmented_data(data)
 
-        # Combine original and augmented data
-        # combined_data = pd.concat([data, augmented_data], ignore_index=True)
-        # print(f"Combined data size: {combined_data.shape}")
+            # Combine original and augmented data
+            combined_data = pd.concat([data, augmented_data], ignore_index=True)
+            print(f"Combined data size: {combined_data.shape}")
 
-        # Check and clean data integrity
-        combined_data = self.check_data_integrity(data)
+            # Check and clean data integrity
+            combined_data = self.check_data_integrity(combined_data)      
+        else:
+            combined_data = self.check_data_integrity(data)
+        
         print(f"Data size after cleaning: {combined_data.shape}")
 
         # Feature Engineering: distance_x is already computed during augmentation
@@ -332,18 +334,24 @@ class ModelTrainer:
                 target = batch['target'].to(device, non_blocking=True)            # (batch_size, 2)
 
                 # with autocast():
-                outputs = self.model(ego_car, agents, speed_limit, agent_mask)
+                outputs, other_output = self.model(ego_car, agents, speed_limit, agent_mask)
                 loss = self.criterion(outputs, target) / self.accumulation_steps
 
                 # print ego_car, agents, speed_limit, agent_mask, target, outputs, loss
+                # other_output = list(other_output)  # Ensure other_output is a list
+                # out1 = other_output[0]
+                # out2 = other_output[1]
+
                 # ego_car = ego_car.cpu().numpy()
                 # agents = agents.cpu().numpy()
                 # speed_limit = speed_limit.cpu().numpy()
                 # agent_mask = agent_mask.cpu().numpy()
                 # target = target.cpu().numpy()
                 # outputs = outputs.detach().cpu().numpy()
+                # out1 = out1.detach().cpu().numpy()
+                # out2 = out2.detach().cpu().numpy()
                 
-                # print(ego_car[0], agents[0], speed_limit[0], agent_mask[0], target[0], outputs[0])
+                # print(ego_car[1], agents[1], speed_limit[1], agent_mask[1], target[1], outputs[1], out1[1], out2[1])
                 
                 if torch.isnan(loss):
                     print(f"NaN loss detected at Epoch {epoch}, Batch {batch_idx + 1}. Stopping training.")
@@ -404,7 +412,7 @@ class ModelTrainer:
 
                 with autocast():
                     # Transformer expects separate inputs: ego, agents, speed_limit, agent_mask
-                    outputs = self.model(ego_car, agents, speed_limit, agent_mask)
+                    outputs, _ = self.model(ego_car, agents, speed_limit, agent_mask)
                     loss = self.criterion(outputs, target)
                 total_loss += loss.item()
 
@@ -478,7 +486,7 @@ def main():
                         help='Proportion of the dataset to include in the test split.')
     parser.add_argument('--lr', type=float, default=0.001,
                         help='Learning rate for the optimizer.')
-    parser.add_argument('--epochs', type=int, default=1000,
+    parser.add_argument('--epochs', type=int, default=200,
                         help='Number of training epochs.')
     parser.add_argument('--model_save_path', type=str, default="best_L2L_model.pth",
                         help='File path to save the best model.')
@@ -490,6 +498,8 @@ def main():
                         help='Number of subprocesses for data loading.')
     parser.add_argument('--patience', type=int, default=100,
                         help='Number of epochs with no improvement after which training will be stopped.')
+    parser.add_argument('--argumented_data', type=bool, default=False,
+                        help='Augment data by adjusting x and speed of ego car.')
     parser.add_argument('--speed_limit', type=float, default=60.0,
                         help='Speed limit to be included as a feature.')
     parser.add_argument('--max_agents', type=int, default=10,
@@ -512,7 +522,7 @@ def main():
         accumulation_steps=args.accumulation_steps,
         num_workers=args.num_workers,  # Adjust based on CPU cores
         patience=args.patience,  # Early stopping patience
-        speed_limit=args.speed_limit,
+        argumented_data=args.argumented_data,
         max_agents=args.max_agents
     )
 

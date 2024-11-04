@@ -12,11 +12,14 @@ from tqdm import tqdm
 import logging
 import argparse
 
-from model import TransformerModel  # Import the TransformerModel class
+from model import TransformerModel, L2LModel, L2LModel_GSP  # Import the TransformerModel class
 
 # Constants for vehicle colors
-LEAD_CAR_COLOR = '#F8B37F'
-FOLLOW_CAR_COLOR = '#202F39'
+SURROUNDING_CAR_COLOR = '#F8B37F'
+EGO_CAR_COLOR = '#202F39'
+
+# Numpy random seed for reproducibility
+np.random.seed(78)
 
 def setup_logging():
     """
@@ -32,7 +35,7 @@ def setup_logging():
     )
 
 class ModelEvaluator:
-    def __init__(self, model_path, data_path, device, ego_desired_speed=60/3.6, num_agents=1, scenario_time=60, time_step=0.1):
+    def __init__(self, model_path, data_path, device, ego_desired_speed=60/3.6, randomize_surrounding_speed=False, surrounding_car_speed=40/3.6, num_agents=1, only_longitudinal=False, scenario_time=60, time_step=0.1):
         """
         Initializes the ModelEvaluator with paths to the model, dataset, and simulation parameters.
 
@@ -40,7 +43,10 @@ class ModelEvaluator:
             model_path (str): Path to the trained model checkpoint.
             data_path (str): Path to the dataset CSV file.
             device (torch.device): Device to run the model on.
+            ego_desired_speed (float): Desired speed for the ego car in m/s.
+            surrounding_car_speed (float): Speed of surrounding cars in m/s.
             num_agents (int): Number of surrounding agents to include (0 to 10).
+            only_longitudinal (bool): Whether to consider only longitudinal control (no lane change).
             scenario_time (float): Total time for the simulation in seconds.
             time_step (float): Time step for the simulation in seconds.
         """
@@ -51,6 +57,9 @@ class ModelEvaluator:
         self.time_step = time_step
         self.device = device
         self.ego_desired_speed = ego_desired_speed
+        self.randomize_surrounding_speed = randomize_surrounding_speed
+        self.surrounding_car_speed = surrounding_car_speed
+        self.only_longitudinal = only_longitudinal
 
         # Initialize the model
         self.model = self.load_trained_model()
@@ -67,7 +76,7 @@ class ModelEvaluator:
         """
         try:
             max_agents = 10  # As per instruction, set max_agents=10
-            model = TransformerModel(max_agents=max_agents).to(self.device)
+            model = L2LModel(max_agents=max_agents).to(self.device)
             checkpoint = torch.load(self.model_path, map_location=self.device)
 
             if 'model_state_dict' in checkpoint:
@@ -107,6 +116,8 @@ class ModelEvaluator:
         self.ego_car_accel_points = []
         self.ego_car_dy_points = []
 
+        self.vectors = []
+
     def evaluate_multilane_scenario(self):
         """
         Evaluates the trained Transformer model in a multilane driving scenario simulation.
@@ -117,7 +128,7 @@ class ModelEvaluator:
             agent = {
                 'x': 50.0 + i*10,    # Start from 50m and space by 10m
                 'y': 0.0,            # Lane position (0: right lane)
-                'speed': 40.0 / 3.6, # Constant speed of 30 km/h converted to m/s
+                'speed': self.surrounding_car_speed, # Constant speed for surrounding cars
             }
             surrounding_agents.append(agent)
 
@@ -166,8 +177,14 @@ class ModelEvaluator:
                 speed_limit_tensor = torch.tensor([[speed_limit]], dtype=torch.float32).to(self.device)
 
                 # Predict acceleration and lane change rate using the Transformer model
-                outputs = self.model(ego_tensor, agents_tensor, speed_limit_tensor, agent_mask_tensor)
+                outputs, _ = self.model(ego_tensor, agents_tensor, speed_limit_tensor, agent_mask_tensor)
                 outputs_np = outputs.cpu().numpy()
+
+                if _ is not None:
+                    out1, out2 = _
+                    vector1 = out1[0].cpu().numpy()
+                    vector2 = out2[0].cpu().numpy()
+                    self.vectors.append((vector1[0], vector2[0]))
 
                 # Check for non-finite values in outputs
                 if not np.all(np.isfinite(outputs_np)):
@@ -195,7 +212,10 @@ class ModelEvaluator:
 
                 # Update ego car state
                 ego_car['accel'] = accel
-                ego_car['dy'] = dy  # Integrate lane change rate
+                if self.only_longitudinal:
+                    ego_car['dy'] = 0.0
+                else:
+                    ego_car['dy'] = dy  # Integrate lane change rate
 
                 # Update ego car speed and position
                 ego_car['speed'] += ego_car['accel'] * self.time_step
@@ -211,8 +231,15 @@ class ModelEvaluator:
                     logging.warning(f"Clipping ego_car y-position from {ego_car['y']:.2f} to 1.5")
                     ego_car['y'] = 1.5
 
-                # Update surrounding agents' positions (constant speed)
+                # Update surrounding agents' positions and speeds
                 for i, agent in enumerate(surrounding_agents):
+                    if self.randomize_surrounding_speed:
+                        # Update speed with random acceleration within [-1, 1] m/s²
+                        delta_speed = np.random.uniform(-2.0 * self.time_step, 2.0 * self.time_step)
+                        agent['speed'] += delta_speed
+                        agent['speed'] = np.clip(agent['speed'], 0.0, 80.0 / 3.6)  # Ensure speed is between 0 and 80 km/h in m/s
+
+                    # Update position based on new speed
                     agent['x'] += agent['speed'] * self.time_step
 
                 # Store data for visualization
@@ -241,16 +268,22 @@ class ModelEvaluator:
         Args:
             save_path (str): Path to save the generated plot.
         """
-        num_plots = 5
+        num_plots = 5 if not self.only_longitudinal else 3
+        if len(self.vectors) > 0:
+            num_plots += 1
         fig, axs = plt.subplots(num_plots, 1, figsize=(12, 5 * num_plots))
+
+        fig_idx = 0
 
         # Plot 1: Surrounding agents and ego car X positions vs time
         if self.num_agents > 0:
             for i in range(self.num_agents):
                 relative_x_positions = [agent_x - ego_x for agent_x, ego_x in zip(self.surrounding_agents_x_points[i], self.ego_car_x_points)]
-                axs[0].plot(self.time_points, relative_x_positions, label=f"Agent {i+1} relative X Position")
+                axs[0].plot(self.time_points, relative_x_positions, color=SURROUNDING_CAR_COLOR, label=f"Agent {i+1} relative X Position")
         else:
-            axs[0].plot(self.time_points, self.ego_car_x_points, label="Ego Car X Position", color='black', linewidth=2)
+            axs[0].plot(self.time_points, self.ego_car_x_points, label="Ego Car X Position", color=EGO_CAR_COLOR, linewidth=2)
+        
+        axs[fig_idx].axhline(y=0, color='gray', linestyle='--', label="Collision Line")
         axs[0].set_title("Surrounding Agents and Ego Car X Positions vs Time")
         axs[0].set_xlabel("Time [s]")
         axs[0].set_ylabel("X Position [m]")
@@ -258,42 +291,64 @@ class ModelEvaluator:
         axs[0].grid(False)
 
         # Plot 2: Surrounding agents and ego car Y (lane) positions vs time
-        for i in range(self.num_agents):
-            axs[1].plot(self.time_points, self.surrounding_agents_y_points[i], label=f"Agent {i+1} Lane Position (Y)")
-        axs[1].plot(self.time_points, self.ego_car_y_points, label="Ego Car Lane Position (Y)", color='black', linewidth=2)
-        axs[1].set_title("Surrounding Agents and Ego Car Lane Positions (Y) vs Time")
-        axs[1].set_xlabel("Time [s]")
-        axs[1].set_ylabel("Y (Lane Position)")
-        axs[1].set_ylim(-0.5, 1.5)
-        axs[1].legend()
-        axs[1].grid(False)
+        if not self.only_longitudinal:
+            fig_idx += 1
+            for i in range(self.num_agents):
+                axs[fig_idx].plot(self.time_points, self.surrounding_agents_y_points[i], color=SURROUNDING_CAR_COLOR, label=f"Agent {i+1} Lane Position (Y)")
+                axs[fig_idx].plot(self.time_points, self.ego_car_y_points, label="Ego Car Lane Position (Y)", color=EGO_CAR_COLOR, linewidth=2)
+                axs[fig_idx].set_title("Surrounding Agents and Ego Car Lane Positions (Y) vs Time")
+                axs[fig_idx].set_xlabel("Time [s]")
+                axs[fig_idx].set_ylabel("Y (Lane Position)")
+                axs[fig_idx].set_ylim(-0.5, 1.5)
+                axs[fig_idx].legend()
+                axs[fig_idx].grid(False)
 
         # Plot 3: Surrounding agents and ego car speeds vs time
+        fig_idx += 1
         for i in range(self.num_agents):
-            axs[2].plot(self.time_points, self.surrounding_agents_speed_points[i], label=f"Agent {i+1} Speed (km/h)")
-        axs[2].plot(self.time_points, self.ego_car_speed_points, label="Ego Car Speed (km/h)", color='black', linewidth=2)
-        axs[2].set_title("Surrounding Agents and Ego Car Speeds vs Time")
-        axs[2].set_xlabel("Time [s]")
-        axs[2].set_ylabel("Speed [km/h]")
-        axs[2].legend()
-        axs[2].grid(False)
+            axs[fig_idx].plot(self.time_points, self.surrounding_agents_speed_points[i], color=SURROUNDING_CAR_COLOR, label=f"Agent {i+1} Speed (km/h)")
+        axs[fig_idx].plot(self.time_points, self.ego_car_speed_points, label="Ego Car Speed (km/h)", color=EGO_CAR_COLOR, linewidth=2)
+        axs[fig_idx].axhline(y=self.ego_desired_speed*3.6, color='gray', linestyle='--', label='Desired Speed (km/h)')
+        axs[fig_idx].set_title("Surrounding Agents and Ego Car Speeds vs Time")
+        axs[fig_idx].set_xlabel("Time [s]")
+        axs[fig_idx].set_ylabel("Speed [km/h]")
+        axs[fig_idx].legend()
+        axs[fig_idx].grid(False)
 
         # Plot 4: Ego car acceleration vs time
-        axs[3].plot(self.time_points, self.ego_car_accel_points, label="Ego Car Acceleration (m/s²)", color='green')
-        axs[3].set_title("Ego Car Acceleration vs Time")
-        axs[3].set_xlabel("Time [s]")
-        axs[3].set_ylabel("Acceleration [m/s²]")
-        axs[3].legend()
-        axs[3].grid(False)
+        fig_idx += 1
+        axs[fig_idx].plot(self.time_points, self.ego_car_accel_points, label="Ego Car Acceleration (m/s²)", color=EGO_CAR_COLOR)
+        axs[fig_idx].set_title("Ego Car Acceleration vs Time")
+        axs[fig_idx].set_xlabel("Time [s]")
+        axs[fig_idx].set_ylabel("Acceleration [m/s²]")
+        axs[fig_idx].legend()
+        axs[fig_idx].grid(False)
 
         # Plot 5: Ego car lane change (dy) vs time
-        axs[4].plot(self.time_points, self.ego_car_dy_points, label="Ego Car Lane Change (dy)", color='red')
-        axs[4].set_title("Ego Car Lane Change (dy) vs Time")
-        axs[4].set_xlabel("Time [s]")
-        axs[4].set_ylabel("Lane Change (dy)")
-        axs[4].set_ylim(-0.25, 0.25)
-        axs[4].legend()
-        axs[4].grid(False)
+        if not self.only_longitudinal:
+            fig_idx += 1
+            axs[fig_idx].plot(self.time_points, self.ego_car_dy_points, label="Ego Car Lane Change (dy)", color=EGO_CAR_COLOR)
+            axs[fig_idx].set_title("Ego Car Lane Change (dy) vs Time")
+            axs[fig_idx].set_xlabel("Time [s]")
+            axs[fig_idx].set_ylabel("Lane Change (dy)")
+            axs[fig_idx].set_ylim(-0.25, 0.25)
+            axs[fig_idx].legend()
+            axs[fig_idx].grid(False)
+
+        # Plot 6: Vector outputs from the model
+        if len(self.vectors) > 0:
+            fig_idx += 1
+            # get all vector1 from self.vectors
+            vector1_all = [v[0] for v in self.vectors]
+            vector2_all = [v[1] for v in self.vectors]
+
+            axs[fig_idx].plot(self.time_points, vector1_all, label=f"Speed Vector")
+            axs[fig_idx].plot(self.time_points, vector2_all, label=f"Agent Vector")
+            axs[fig_idx].set_title("Model Output Vectors vs Time")
+            axs[fig_idx].set_xlabel("Time [s]")
+            axs[fig_idx].set_ylabel("Values")
+            axs[fig_idx].legend()
+            axs[fig_idx].grid(False)
 
         plt.tight_layout()
         plt.savefig(save_path)
@@ -336,7 +391,7 @@ class ModelEvaluator:
                     for i in range(evaluator.num_agents):
                         agent_x = evaluator.surrounding_agents_x_points[i][frame] - evaluator.ego_car_x_points[frame]
                         agent_y = evaluator.surrounding_agents_y_points[i][frame]
-                        agent_rect = plt.Rectangle((agent_x - 2.5, agent_y - 0.3), 5, 0.6, color=LEAD_CAR_COLOR)
+                        agent_rect = plt.Rectangle((agent_x - 2.5, agent_y - 0.3), 5, 0.6, color=SURROUNDING_CAR_COLOR)
                         ax.add_patch(agent_rect)
                         ax.text(agent_x, agent_y + 0.5, f"Agent {i+1}", ha='center', va='bottom', fontsize=8, color='black')
 
@@ -347,7 +402,7 @@ class ModelEvaluator:
                 # Plot ego car
                 ego_car_x = 0
                 ego_car_y = evaluator.ego_car_y_points[frame]
-                ego_car_rect = plt.Rectangle((ego_car_x - 2.5, ego_car_y - 0.3), 5, 0.6, color=FOLLOW_CAR_COLOR)
+                ego_car_rect = plt.Rectangle((ego_car_x - 2.5, ego_car_y - 0.3), 5, 0.6, color=EGO_CAR_COLOR)
                 ax.add_patch(ego_car_rect)
                 ax.text(ego_car_x, ego_car_y + 0.5, "Ego Car", ha='center', va='bottom', fontsize=8, color='black')
 
@@ -416,15 +471,23 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate Neural Network Model for Ego Car Control")
     parser.add_argument('--data_file', type=str, default="lane_change_simulations_data.csv",
                         help='Path to the CSV data file.')
-    parser.add_argument('--model_path', type=str, default="best_L2L_model.pth",
+    parser.add_argument('--model_path', type=str, default="model/model_imitation.pth",
                         help='Path to the trained model file.')
+    parser.add_argument('--scenario_time', type=float, default=120.0,
+                    help='Total time for the simulation in seconds.')
     parser.add_argument('--ego_desired_speed', type=float, default=60.0,
                         help='Speed limit to be included as a feature. (km/h)')
+    parser.add_argument('--surrounding_car_speed', type=float, default=40.0,
+                    help='Surrounding car speed be included as a feature. (km/h)')
     parser.add_argument('--num_agents', type=int, default=1,
                         help='Number of surrounding agents in simulator (TBD).')
-    parser.add_argument('--generate_frame_pics', type=bool, default=False,
+    parser.add_argument('--randomize_surrounding_speed', action='store_true',
+                        help='Randomize surrounding car speed during simulation.')
+    parser.add_argument('--only_longitudinal', action='store_true',
+                        help='Only consider longitudinal control (no lane change).')
+    parser.add_argument('--generate_frame_pics', action='store_true',
                         help='Generate frame images for video creation.')
-    parser.add_argument('--generate_video', type=bool, default=False,
+    parser.add_argument('--generate_video', action='store_true',
                         help='Generate video from frame images.')
 
     return parser.parse_args()
@@ -450,15 +513,17 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logging.info(f"Using device: {device}")
 
-
     # Initialize the ModelEvaluator
     evaluator = ModelEvaluator(
         data_path=args.data_file,
         model_path=args.model_path,
         device=device,
         ego_desired_speed=args.ego_desired_speed/3.6, # in m/s
+        randomize_surrounding_speed=args.randomize_surrounding_speed,
+        surrounding_car_speed=args.surrounding_car_speed/3.6,  # in m/s
         num_agents=args.num_agents,
-        scenario_time=120,  # 120 seconds simulation
+        only_longitudinal=args.only_longitudinal,
+        scenario_time=args.scenario_time,  # 300 seconds simulation
         time_step=0.1       # 0.1 second time step
     )
 

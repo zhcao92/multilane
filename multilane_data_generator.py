@@ -92,23 +92,33 @@ class Simulator:
         self.idx = 0
 
     def run(self):
+
+        # Setting simulation data for different scenarios
         for _ in range(30):
             self.simulation_num += 1
-            self._run_single_simulation(surrounding_vehicle_exists = True, surrounding_vehicle_speed=30 / 3.6)
+            self._run_single_simulation(surrounding_vehicle_exists = True, ego_deisred_speed = 60/3.6, surrounding_vehicle_speed=30 / 3.6)
 
         for _ in range(30):
             self.simulation_num += 1
-            self._run_single_simulation(surrounding_vehicle_exists = True, surrounding_vehicle_speed=40 / 3.6)
+            self._run_single_simulation(surrounding_vehicle_exists = True, ego_deisred_speed = 60/3.6, surrounding_vehicle_speed=40 / 3.6)
         
         for _ in range(30):
             self.simulation_num += 1
-            self._run_single_simulation(surrounding_vehicle_exists = False)
+            self._run_single_simulation(surrounding_vehicle_exists = False, ego_deisred_speed = 60/3.6)
+        
+        for _ in range(30):
+            self.simulation_num += 1
+            self._run_single_simulation(surrounding_vehicle_exists = False, ego_deisred_speed = 30/3.6)
+
+        for _ in range(30):
+            self.simulation_num += 1
+            self._run_single_simulation(surrounding_vehicle_exists = True, ego_deisred_speed = 30/3.6, surrounding_vehicle_speed=40 / 3.6)
 
         # Convert the collected data into a DataFrame and save to a CSV file
         df = pd.DataFrame(self.simulation_data)
         df.to_csv("lane_change_simulations_data.csv", index=False)
 
-    def _run_single_simulation(self, surrounding_vehicle_exists=True, surrounding_vehicle_speed=30 / 3.6):
+    def _run_single_simulation(self, surrounding_vehicle_exists=True, ego_deisred_speed = 60/3.6, surrounding_vehicle_speed=30 / 3.6):
 
         # Initialize the vehicles for the simulation
         if surrounding_vehicle_exists:
@@ -116,7 +126,7 @@ class Simulator:
         else:
             surrounding_vehicle = None
 
-        ego_vehicle = Vehicle(lane=0, position=0, velocity=0, desired_speed=60 / 3.6, lane_change = False)  # Using 60 km/h as desired speed
+        ego_vehicle = Vehicle(lane=0, position=0, velocity=0, desired_speed=ego_deisred_speed, lane_change = False)  # Using 60 km/h as desired speed
 
         time_points = np.arange(0, SIMULATION_TIME, TIME_STEP)
 

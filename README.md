@@ -8,14 +8,14 @@ This project simulates the multilane driving scenarios to train a planning model
 - `model_training_transformer.py`: Model training
 - `model_evaluator_transformer.py`: Model evaluation in multilan scenarios
 
-## Run evaluation
-
-Evaluate imitation model without front car
+## Run training
 ```sh
-python model_evaluator_transformer.py --model_path='model/model_imitation.pth' --num_agents=0
+python model_training_L2L.py
 ```
 
-Evaluate imitation model with front car
+## Run evaluation
+
+Evaluate L2L model
 ```sh
-python model_evaluator_transformer.py --model_path='model/model_imitation.pth' --num_agents=1
+python model_evaluator_L2L.py --model_path='best_model_L2L.pth' --ego_desired_speed=60 --surrounding_car=30 --num_agents=0 --only_longitudinal
 ```
